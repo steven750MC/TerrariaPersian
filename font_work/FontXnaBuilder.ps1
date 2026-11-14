@@ -23,6 +23,34 @@ function Resolve-FontWorkPath {
     return [System.IO.Path]::GetFullPath((Join-Path $ScriptDir $Path))
 }
 
+# 将 "0020-005D,00AB,FB56-FB59" 形式的 Unicode 范围展开为字符串
+function ConvertFrom-UnicodeRanges {
+    param([string]$Ranges)
+    if ([string]::IsNullOrWhiteSpace($Ranges)) { return "" }
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($part in ($Ranges -split '[,\s]+' | Where-Object { $_ })) {
+        $p = $part.Trim() -replace '^(U\+|0x)', ''
+        if ($p -match '^([0-9A-Fa-f]+)-([0-9A-Fa-f]+)$') {
+            $s = [Convert]::ToInt32($Matches[1], 16)
+            $e = [Convert]::ToInt32($Matches[2], 16)
+        }
+        elseif ($p -match '^[0-9A-Fa-f]+$') {
+            $s = [Convert]::ToInt32($p, 16)
+            $e = $s
+        }
+        else {
+            Write-Host "    ⚠ 无法解析 Unicode 范围: '$part'" -ForegroundColor Yellow
+            continue
+        }
+        for ($cp = $s; $cp -le $e; $cp++) {
+            if ($cp -lt 0x20) { continue }
+            if ($cp -ge 0xD800 -and $cp -le 0xDFFF) { continue }
+            [void]$sb.Append([char]::ConvertFromUtf32($cp))
+        }
+    }
+    return $sb.ToString()
+}
+
 # 字体配置列表
 $fontConfigs = @{}
 foreach ($fontName in $Config.fonts.PSObject.Properties.Name) {
@@ -36,6 +64,7 @@ foreach ($fontName in $Config.fonts.PSObject.Properties.Name) {
         CharInfoFile = Resolve-FontWorkPath $fontData.charInfoFile
         ExtraChars = [string]$fontData.extraChars
         ExtraCharsFile = Resolve-FontWorkPath $fontData.extraCharsFile
+        UnicodeRanges = [string]$fontData.extraUnicodeRanges
     }
 }
 
@@ -49,6 +78,9 @@ $FontInfoDir = Resolve-FontWorkPath $Config.global.fontInfoDir
 $GlobalExtraChars = [string]$Config.global.extraChars
 $GlobalExtraCharsFile = Resolve-FontWorkPath $Config.global.extraCharsFile
 
+# 全局额外 Unicode 范围（可选，应用到所有字体，与各字体自身的 extraUnicodeRanges 合并）
+$GlobalUnicodeRanges = [string]$Config.global.extraUnicodeRanges
+
 # 纹理画布尺寸（像素，默认 1024；2048 可让每页容量翻 4 倍，从而减少总页数）
 $PageSize = [int]$Config.conversion.pageSize
 if ($PageSize -lt 1) { $PageSize = 1024 }
@@ -60,7 +92,7 @@ $CharSpacing = $Config.conversion.charSpacing
 # 公共函数：检查环境
 function Test-Environment {
     Write-Host "`n[环境检查]" -ForegroundColor Cyan
-    
+
     # 检查 .NET SDK
     $dotnetVersion = dotnet --version 2>$null
     if (-not $dotnetVersion) {
@@ -69,42 +101,42 @@ function Test-Environment {
         return $false
     }
     Write-Host "  ✓ .NET SDK $dotnetVersion" -ForegroundColor Green
-    
+
     # 检查 BMFont
     if (-not (Test-Path $BMFontExe)) {
         Write-Host "  ✗ 未找到 BMFont: $BMFontExe" -ForegroundColor Red
         return $false
     }
     Write-Host "  ✓ BMFont: $BMFontExe" -ForegroundColor Green
-    
+
     # 检查源字体
     if (-not (Test-Path $SourceFont)) {
         Write-Host "  ✗ 未找到源字体: $SourceFont" -ForegroundColor Red
         return $false
     }
     Write-Host "  ✓ 源字体: $SourceFont" -ForegroundColor Green
-    
+
     # 检查 FontInfo 目录
     if (-not (Test-Path $FontInfoDir)) {
         Write-Host "  ✗ 未找到 FontInfo 目录" -ForegroundColor Red
         return $false
     }
     Write-Host "  ✓ FontInfo 目录" -ForegroundColor Green
-    
+
     # 检查 XnaFontRebuilder 项目
     if (-not (Test-Path ".\XnaFontRebuilder\XnaFontRebuilder.csproj")) {
         Write-Host "  ✗ 未找到 XnaFontRebuilder 项目" -ForegroundColor Red
         return $false
     }
     Write-Host "  ✓ XnaFontRebuilder 项目" -ForegroundColor Green
-    
+
     return $true
 }
 
 # 公共函数：构建 XnaFontRebuilder
 function Build-XnaFontRebuilder {
     Write-Host "`n[构建 XnaFontRebuilder]" -ForegroundColor Cyan
-    
+
     if (-not (Test-Path $XnaFontRebuilder)) {
         Write-Host "  正在构建..." -ForegroundColor Yellow
         try {
@@ -124,7 +156,7 @@ function Build-XnaFontRebuilder {
     else {
         Write-Host "  ✓ 已存在，跳过构建" -ForegroundColor Green
     }
-    
+
     return $true
 }
 
@@ -134,15 +166,16 @@ function Generate-ConfigFile {
         [string]$FontName,
         [hashtable]$FontConfig
     )
-    
+
     Write-Host "  [0/3] 生成配置文件..." -ForegroundColor Yellow
-    
+
     # 检查字符信息文件是否存在
     if (-not (Test-Path $FontConfig.CharInfoFile)) {
         Write-Host "    ✗ 字符信息文件不存在: $($FontConfig.CharInfoFile)" -ForegroundColor Red
         return $false
     }
-    
+
+    $rangeTmpFile = $null
     try {
         # 使用 --build-cfg-auto 命令生成配置文件
         # 从 XNA 二进制字体文件提取字符信息并生成 BMFont 配置
@@ -171,6 +204,18 @@ function Generate-ConfigFile {
             $builderArgs += "--extra-chars-file"
             $builderArgs += $FontConfig.ExtraCharsFile
         }
+
+        # 将 config.json 中的 extraUnicodeRanges 展开为字符，写入临时 UTF-8 文件
+        # （直接在命令行传递阿拉伯/波斯字符可能出现编码问题，所以走文件）
+        $rangeChars = (ConvertFrom-UnicodeRanges $GlobalUnicodeRanges) + (ConvertFrom-UnicodeRanges $FontConfig.UnicodeRanges)
+        if (-not [string]::IsNullOrEmpty($rangeChars)) {
+            $rangeTmpFile = Join-Path ([System.IO.Path]::GetTempPath()) "$FontName.unicode_extra.txt"
+            [System.IO.File]::WriteAllText($rangeTmpFile, $rangeChars, (New-Object System.Text.UTF8Encoding $false))
+            $builderArgs += "--extra-chars-file"
+            $builderArgs += $rangeTmpFile
+            Write-Host "    · Unicode 范围展开: $($rangeChars.Length) 个字符" -ForegroundColor Gray
+        }
+
         if ($PageSize -ne 1024) {
             $builderArgs += "--page-size"
             $builderArgs += $PageSize
@@ -186,26 +231,28 @@ function Generate-ConfigFile {
         # 捕获 dotnet 输出并转发到日志，避免其 stdout 泄漏进函数返回值
         $cfgOut = & dotnet $builderArgs 2>&1
         $cfgCode = $LASTEXITCODE
+        if ($rangeTmpFile -and (Test-Path $rangeTmpFile)) { Remove-Item $rangeTmpFile -Force }
         $cfgOut | ForEach-Object { Write-Host "    $_" -ForegroundColor Gray }
-        
+
         if ($cfgCode -ne 0) {
             throw "配置文件生成失败，退出代码: $cfgCode"
         }
-        
+
         if (-not (Test-Path $FontConfig.ConfigFile)) {
             throw "未找到生成的配置文件"
         }
-        
+
         # 打印关键配置项，便于在 CI 日志中排查 BMFont 字体加载问题
         $fontNameLine = (Select-String -Path $FontConfig.ConfigFile -Pattern '^fontName=' | Select-Object -First 1).Line
         $fontFileLine = (Select-String -Path $FontConfig.ConfigFile -Pattern '^fontFile=' | Select-Object -First 1).Line
         Write-Host "    · $fontNameLine" -ForegroundColor Gray
         Write-Host "    · $fontFileLine" -ForegroundColor Gray
-        
+
         Write-Host "    ✓ 配置文件生成成功: $($FontConfig.ConfigFile)" -ForegroundColor Green
         return $true
     }
     catch {
+        if ($rangeTmpFile -and (Test-Path $rangeTmpFile)) { Remove-Item $rangeTmpFile -Force }
         Write-Host "    ✗ 失败: $_" -ForegroundColor Red
         return $false
     }
@@ -217,28 +264,28 @@ function Generate-Font {
         [string]$FontName,
         [hashtable]$FontConfig
     )
-    
+
     Write-Host "`n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor Magenta
     Write-Host "  生成字体: $FontName" -ForegroundColor Cyan
     Write-Host "  描述: $($FontConfig.Description)" -ForegroundColor Gray
     Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor Magenta
-    
+
     $startTime = Get-Date
-    
+
     # 步骤0: 生成配置文件
     if (-not (Generate-ConfigFile -FontName $FontName -FontConfig $FontConfig)) {
         return $false
     }
-    
+
     # 确保输出目录存在
     if (-not (Test-Path $FontConfig.OutputDir)) {
         New-Item -ItemType Directory -Path $FontConfig.OutputDir -Force | Out-Null
         Write-Host "  ✓ 创建输出目录: $($FontConfig.OutputDir)" -ForegroundColor Gray
     }
-    
+
     $fontPath = Join-Path $FontConfig.OutputDir $FontConfig.FontFile
     $txtPath = Join-Path $FontConfig.OutputDir $FontConfig.TxtFile
-    
+
     # 步骤1: 生成 BMFont
     Write-Host "  [1/3] 生成 BMFont 文件..." -ForegroundColor Yellow
     try {
@@ -252,15 +299,15 @@ function Generate-Font {
         $process = Start-Process -FilePath $BMFontExe `
             -ArgumentList $bmfontArgs `
             -Wait -PassThru -WorkingDirectory $ScriptDir
-        
+
         if ($process.ExitCode -ne 0 -and $null -ne $process.ExitCode) {
             throw "BMFont 生成失败，退出代码: $($process.ExitCode)"
         }
-        
+
         if (-not (Test-Path $fontPath)) {
             throw "未找到生成的 .fnt 文件"
         }
-        
+
         # 打印 .fnt 的字符数与页数，便于在 CI 日志中确认 CJK 字形是否被正确渲染
         $fntCharCount = 0
         $fntPageCount = 0
@@ -272,7 +319,7 @@ function Generate-Font {
         } catch {
             Write-Host "    · 无法解析 .fnt 统计信息: $_" -ForegroundColor Gray
         }
-        
+
         # 统计生成的图片
         $pngFiles = Get-ChildItem -Path $FontConfig.OutputDir -Filter "$($FontName)_*.png" -ErrorAction SilentlyContinue
         Write-Host "    ✓ 生成成功，纹理图片: $($pngFiles.Count) 张" -ForegroundColor Green
@@ -304,7 +351,7 @@ function Generate-Font {
         Write-Host "    ✗ 失败: $_" -ForegroundColor Red
         return $false
     }
-    
+
     # 步骤2: 转换格式（使用新的 --convert 命令）
     Write-Host "  [2/3] 转换为 TXT 格式..." -ForegroundColor Yellow
     try {
@@ -313,43 +360,43 @@ function Generate-Font {
         $convOut = & dotnet $XnaFontRebuilder --convert $fontPath $txtPath --latin-compensation $LatinCompensation --char-spacing $CharSpacing 2>&1
         $convCode = $LASTEXITCODE
         $convOut | ForEach-Object { Write-Host "    $_" -ForegroundColor Gray }
-        
+
         if ($convCode -ne 0) {
             throw "格式转换失败，退出代码: $convCode"
         }
-        
+
         if (-not (Test-Path $txtPath)) {
             throw "未找到生成的 .txt 文件"
         }
-        
+
         Write-Host "    ✓ 转换成功" -ForegroundColor Green
     }
     catch {
         Write-Host "    ✗ 失败: $_" -ForegroundColor Red
         return $false
     }
-    
+
     # 步骤3: 验证输出
     Write-Host "  [3/3] 验证输出文件..." -ForegroundColor Yellow
-    
+
     $fntSize = (Get-Item $fontPath).Length
     $txtSize = (Get-Item $txtPath).Length
     $pngCount = (Get-ChildItem -Path $FontConfig.OutputDir -Filter "*.png").Count
-    
+
     Write-Host "    ✓ .fnt: $([math]::Round($fntSize/1KB, 2)) KB" -ForegroundColor Green
     Write-Host "    ✓ .txt: $([math]::Round($txtSize/1KB, 2)) KB" -ForegroundColor Green
     Write-Host "    ✓ 纹理: $pngCount 张图片" -ForegroundColor Green
-    
+
     # 删除临时配置文件
     if (Test-Path $FontConfig.ConfigFile) {
         Remove-Item $FontConfig.ConfigFile -Force
         Write-Host "    ✓ 删除临时配置文件: $($FontConfig.ConfigFile)"  -ForegroundColor Green
     }
-    
+
     $endTime = Get-Date
     $duration = ($endTime - $startTime).TotalSeconds
     Write-Host "  ✅ $FontName 生成完成，耗时: $([math]::Round($duration, 2)) 秒" -ForegroundColor Green
-    
+
     return $true
 }
 
@@ -358,12 +405,13 @@ function Show-AvailableFonts {
     Write-Host "`n可用字体列表:" -ForegroundColor Cyan
     Write-Host ("{0,-15} {1,-30} {2,-20} {3,-12} {4}" -f "名称", "描述", "字符信息文件", "额外字符", "配置文件") -ForegroundColor Gray
     Write-Host ("{0,-15} {1,-30} {2,-20} {3,-12} {4}" -f "----", "----", "--------", "--------", "--------") -ForegroundColor Gray
-    
+
     foreach ($name in $fontConfigs.Keys | Sort-Object) {
         $fontCfg = $fontConfigs[$name]
         $charExists = if (Test-Path $fontCfg.CharInfoFile) { "✓" } else { "✗" }
         $cfgExists = if (Test-Path $fontCfg.ConfigFile) { "✓" } else { "✗" }
         $extraCount = ($GlobalExtraChars + $fontCfg.ExtraChars).Length
+        $extraCount += (ConvertFrom-UnicodeRanges ($GlobalUnicodeRanges + "," + $fontCfg.UnicodeRanges)).Length
         foreach ($filePath in @($GlobalExtraCharsFile, $fontCfg.ExtraCharsFile)) {
             if (-not [string]::IsNullOrEmpty($filePath) -and (Test-Path $filePath)) {
                 $text = [System.IO.File]::ReadAllText($filePath)
@@ -411,31 +459,31 @@ function Main {
         [string]$Font,
         [switch]$Rebuild
     )
-    
+
     # 显示帮助
     if ($Help) {
         Show-Help
         return
     }
-    
+
     # 列出字体
     if ($List) {
         Show-AvailableFonts
         return
     }
-    
+
     # 显示标题
     Write-Host "╔══════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
     Write-Host "║                    字体批量生成工具 v3.0                      ║" -ForegroundColor Cyan
     Write-Host "╚══════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
     Write-Host "开始时间: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -ForegroundColor Yellow
-    
+
     # 环境检查
     if (-not (Test-Environment)) {
         Write-Host "`n❌ 环境检查失败，请解决上述问题后重试" -ForegroundColor Red
         exit 1
     }
-    
+
     # 构建 XnaFontRebuilder
     if ($Rebuild) {
         Write-Host "`n[强制重新构建]" -ForegroundColor Yellow
@@ -443,15 +491,15 @@ function Main {
             Remove-Item $XnaFontRebuilder -Force
         }
     }
-    
+
     if (-not (Build-XnaFontRebuilder)) {
         Write-Host "`n❌ XnaFontRebuilder 构建失败" -ForegroundColor Red
         exit 1
     }
-    
+
     # 确定要生成的字体列表
     $fontsToGenerate = @{}
-    
+
     if ($Font) {
         # 生成单个字体
         if ($fontConfigs.ContainsKey($Font)) {
@@ -467,12 +515,12 @@ function Main {
         $fontsToGenerate = $fontConfigs
         Write-Host "`n🎯 目标: 生成所有字体 ($($fontConfigs.Count) 个)" -ForegroundColor Cyan
     }
-    
+
     # 执行生成
     $successList = @()
     $failList = @()
     $totalStart = Get-Date
-    
+
     foreach ($name in $fontsToGenerate.Keys | Sort-Object) {
         $result = Generate-Font -FontName $name -FontConfig $fontsToGenerate[$name]
         if ($result) {
@@ -481,18 +529,18 @@ function Main {
             $failList += $name
         }
     }
-    
+
     # 输出总结
     $totalEnd = Get-Date
     $totalDuration = ($totalEnd - $totalStart).TotalSeconds
-    
+
     Write-Host "`n╔══════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
     Write-Host "║                        执行结果汇总                           ║" -ForegroundColor Cyan
     Write-Host "╚══════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
     Write-Host "完成时间: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -ForegroundColor Yellow
     Write-Host "总耗时: $([math]::Round($totalDuration, 2)) 秒" -ForegroundColor Yellow
     Write-Host ""
-    
+
     Write-Host "✅ 成功: $($successList.Count) 个" -ForegroundColor Green
     if ($successList.Count -gt 0) {
         foreach ($name in $successList) {
@@ -500,16 +548,16 @@ function Main {
             Write-Host "   • $name -> $outputDir" -ForegroundColor Gray
         }
     }
-    
+
     if ($failList.Count -gt 0) {
         Write-Host "`n❌ 失败: $($failList.Count) 个" -ForegroundColor Red
         foreach ($name in $failList) {
             Write-Host "   • $name" -ForegroundColor Red
         }
     }
-    
+
     Write-Host ""
-    
+
     if ($failList.Count -eq 0) {
         Write-Host "🎉 所有字体生成成功！" -ForegroundColor Green
         exit 0
